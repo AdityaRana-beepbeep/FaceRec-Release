@@ -1,6 +1,6 @@
 # Face Recognition with Age and Gender Detection
 
-This is a Python-based project for face recognition using OpenCV, with added capabilities for detecting age and gender.
+This is a Python-based project for face recognition using OpenCV and flask, with added capabilities for detecting age and gender.
 
 ## Features
 - Real-time face recognition.
@@ -10,12 +10,13 @@ This is a Python-based project for face recognition using OpenCV, with added cap
 ## Technology Stack
 - Python
 - OpenCV
+- Flask
 - Haar Cascade for face detection.
 - LBPHFaceRecognizer for face recognition.
 - Caffe models for age and gender prediction.
 
 ## How to Run
-1. Clone this repository: `git clone https://github.com/AdityaRana-beepbeep/FaceRec.git`
+1. Clone this repository: `git clone https://github.com/AdityaRana-beepbeep/FaceRec-Release.git`
 2. Navigate to the project directory.
 3. Install dependencies: `pip install -r requirements.txt`
 4. Run the main script: `python main.py`
