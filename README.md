@@ -1,6 +1,6 @@
 # Face Recognition with Age and Gender Detection
 
-This is a Python-based project for face recognition using OpenCV and flask, with added capabilities for detecting age and gender.
+This is a Python-based project for face recognition using OpenCV, numpy, tensorflow and flask, with added capabilities for detecting age and gender.
 
 ## Features
 - Real-time face recognition.
@@ -11,6 +11,8 @@ This is a Python-based project for face recognition using OpenCV and flask, with
 - Python
 - OpenCV
 - Flask
+- Numpy
+- Tensorflow
 - Haar Cascade for face detection.
 - LBPHFaceRecognizer for face recognition.
 - Caffe models for age and gender prediction.
