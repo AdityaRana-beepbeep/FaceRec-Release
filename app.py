@@ -1,195 +1,254 @@
-from flask import Flask, render_template, Response, request, jsonify
-import cv2
 import os
+import cv2
 import requests
 import numpy as np
+import threading
+import time
+import json
 
-app = Flask(__name__)
+from flask import Flask, render_template, Response, request, jsonify
+from flask_cors import CORS
+from queue import Queue
 
-# Global variables to control recognition and store current predictions
+app = Flask(__name__, template_folder='templates')
+CORS(app)
+
+# --- Global variables to control recognition and store current predictions ---
 recognition_active = False
-current_prediction = {} # Stores data for the last detected face
+# Use a Queue for thread-safe prediction updates
+prediction_queue = Queue()
 
-# --- Face Recognition Setup ---
-PersonNames = ['Aditya']    # Must match order of labels in your trained model
-# Using os.path.dirname(__file__) to ensure model path is relative to the script's location
-face_recognizer_model_path = os.path.join(os.path.dirname(__file__), "face_recogonizer.yml")
-
-# Create LBPH face recognizer and load trained data
-my_model = cv2.face.LBPHFaceRecognizer_create()
-if os.path.exists(face_recognizer_model_path):
-    try:
-        my_model.read(face_recognizer_model_path)
-        print("Loaded face recognizer model.")
-    except cv2.error as e:
-        print(f"Error loading face recognizer model: {e}")
-        print("Please ensure 'face_recogonizer.yml' is a valid model file.")
-        my_model = None # Set to None if loading fails to prevent further errors
-else:
-    print(f"Warning: Face recognizer model file '{face_recognizer_model_path}' not found! Please run train_age_gender.py first.")
-    my_model = None
-
-# Face Detector (Haar Cascade)
-# CORRECTED TYPO: 'haascade' changed to 'haarcascade'
-face_detector = cv2.CascadeClassifier(cv2.data.haarcascades + 'haarcascade_frontalface_default.xml')
-if face_detector.empty(): # Check if the cascade classifier loaded correctly
-    print("Error: Could not load Haar Cascade XML file. Face detection will not work.")
-    print("Please ensure 'haarcascade_frontalface_default.xml' is available in your OpenCV data path.")
-    face_detector = None # Set to None if it failed to load
-
-# --- Age and Gender Detection Setup ---
-# No longer using download_file function in app.py as we assume manual download
-# You should ensure these files are in the same directory as app.py
-
-# Local filenames for these models
-# Using os.path.dirname(__file__) for robust path resolution
+# --- Model Paths ---
+face_recognizer_model_path = os.path.join(os.path.dirname(__file__), "face_recognizer.yaml")
 age_deploy_file = os.path.join(os.path.dirname(__file__), "age_deploy.prototxt")
 age_net_file = os.path.join(os.path.dirname(__file__), "age_net.caffemodel")
 gender_deploy_file = os.path.join(os.path.dirname(__file__), "gender_deploy.prototxt")
 gender_net_file = os.path.join(os.path.dirname(__file__), "gender_net.caffemodel")
 
-# Load Age and Gender models only if all necessary files are present
+# --- Age and Gender Detection Model URLs (for initial download) ---
+age_deploy_url = "https://raw.githubusercontent.com/spmallick/learnopencv/master/AgeGender/age_deploy.prototxt"
+age_net_url = "https://raw.githubusercontent.com/spmallick/learnopencv/master/AgeGender/age_net.caffemodel"
+gender_deploy_url = "https://raw.githubusercontent.com/spmallick/learnopencv/master/AgeGender/gender_deploy.prototxt"
+gender_net_url = "https://raw.githubusercontent.com/spmallick/learnopencv/master/AgeGender/gender_net.caffemodel"
+
+# --- Helper Function to Download Models ---
+def download_file(url, filename):
+    if not os.path.exists(filename):
+        print(f"Downloading {filename} from {url}...")
+        try:
+            response = requests.get(url, stream=True)
+            response.raise_for_status()
+            with open(filename, 'wb') as file:
+                for chunk in response.iter_content(chunk_size=8192):
+                    file.write(chunk)
+            print(f"Downloaded {filename} successfully.")
+            return True
+        except requests.exceptions.RequestException as e:
+            print(f"Error downloading {filename} from {url}: {e}")
+            print("Please check your internet connection or the URL.")
+            return False
+    else:
+        print(f"{filename} already exists.")
+    return True
+
+# --- Global Model Variables ---
+my_model = None
+face_detector = None
 age_net = None
 gender_net = None
 
-# Explicitly check for file existence before attempting to load
-age_files_exist = os.path.exists(age_deploy_file) and os.path.exists(age_net_file)
-gender_files_exist = os.path.exists(gender_deploy_file) and os.path.exists(gender_net_file)
+# --- Dynamic PersonNames Loading ---
+PersonNames = []
+real_people_dir = os.path.join(os.path.dirname(__file__), "RealPeople")
+def load_person_names():
+    global PersonNames
+    PersonNames = []
+    if os.path.exists(real_people_dir):
+        for f in os.listdir(real_people_dir):
+            path = os.path.join(real_people_dir, f)
+            if os.path.isdir(path):
+                PersonNames.append(f)
+        PersonNames.sort()
+        print(f"Loaded {len(PersonNames)} recognized people from 'RealPeople' directory: {PersonNames}")
+    else:
+        print(f"Warning: 'RealPeople' directory not found at '{real_people_dir}'.")
+        print("Face recognition will not work without trained data.")
+load_person_names()
 
-if age_files_exist and gender_files_exist:
-    try:
-        age_net = cv2.dnn.readNet(age_deploy_file, age_net_file)
-        gender_net = cv2.dnn.readNet(gender_deploy_file, gender_net_file)
-        print("Loaded Age and Gender detection models.")
-    except cv2.error as e:
-        print(f"Error loading DNN models: {e}")
-        print(f"Ensure the model files are not corrupted and are in the correct directory: {os.path.dirname(__file__)}")
-else:
-    print("Warning: One or more Age/Gender model files are missing. Age/Gender prediction will not work.")
-    if not age_files_exist:
-        print(f"  Missing Age model files: {age_deploy_file} or {age_net_file}")
-    if not gender_files_exist:
-        print(f"  Missing Gender model files: {gender_deploy_file} or {gender_net_file}")
+# --- Function to Load All Models ---
+def load_all_models():
+    global my_model, face_detector, age_net, gender_net
+    load_person_names()
 
+    if os.path.exists(face_recognizer_model_path):
+        try:
+            my_model = cv2.face.LBPHFaceRecognizer_create()
+            my_model.read(face_recognizer_model_path)
+            print("Loaded face recognizer model (face_recognizer.yaml).")
+        except cv2.error as e:
+            print(f"Error loading face recognizer model: {e}")
+            print("Please ensure 'face_recognizer.yaml' is a valid model file from train_age_gender.py.")
+            my_model = None
+    else:
+        print(f"Warning: Face recognizer model file '{face_recognizer_model_path}' not found!")
+        print("Please run train_age_gender.py first to train the model.")
+        my_model = None
 
+    face_detector = cv2.CascadeClassifier(cv2.data.haarcascades + 'haarcascade_frontalface_default.xml')
+    if face_detector.empty():
+        print("Error: Could not load Haar Cascade XML file. Face detection will not work.")
+        face_detector = None
+
+    age_models_ready = download_file(age_deploy_url, age_deploy_file) and download_file(age_net_url, age_net_file)
+    gender_models_ready = download_file(gender_deploy_url, gender_deploy_file) and download_file(gender_net_url, gender_net_file)
+
+    if age_models_ready and gender_models_ready:
+        try:
+            age_net = cv2.dnn.readNet(age_deploy_file, age_net_file)
+            gender_net = cv2.dnn.readNet(gender_deploy_file, gender_net_file)
+            print("Loaded Age and Gender detection models.")
+        except cv2.error as e:
+            print(f"Error loading DNN models: {e}")
+            print("Ensure the model files are not corrupted and are in the correct directory.")
+            age_net = None
+            gender_net = None
+    else:
+        print("Warning: One or more Age/Gender model files are missing or failed to download. Age/Gender prediction will not work.")
+
+# Model specific constants
 MODEL_MEAN_VALUES = (78.4263377603, 87.901088945, 114.5965258849)
 age_list = ['(0-2)', '(4-6)', '(8-12)', '(15-20)', '(21-24)', '(25-32)', '(33-37)', '(38-43)', '(44-47)', '(48-53)', '(60-100)']
 gender_list = ['Male', 'Female']
 
-# --- Video Streaming and Processing ---
+# UI display settings (used for drawing on frames)
+COLOR_RECOGNIZED = (10, 255, 10)
+COLOR_UNKNOWN = (0, 0, 255)
+COLOR_TEXT_BG = (50, 50, 50)
+COLOR_TEXT = (255, 255, 255)
+FONT = cv2.FONT_HERSHEY_SIMPLEX
+FONT_SCALE = 0.8
+FONT_THICKNESS = 2
+PADDING = 5
+LINE_HEIGHT_OFFSET = 30
+
+# --- Video Streaming and Processing Function (MAIN LOGIC) ---
 def generate_frames():
-    global current_prediction, recognition_active
-    cap = cv2.VideoCapture(0) # 0 for default camera
+    global recognition_active
+
+    cap = cv2.VideoCapture(0)
     if not cap.isOpened():
         print("Error: Cannot access the camera. Please check if it's in use or connected.")
-        # Return an empty frame or error image to Flask
         while True:
-            # Create a black image with error text
             error_frame = np.zeros((480, 640, 3), dtype=np.uint8)
-            cv2.putText(error_frame, "Camera Error: Check connection", (50, 240), cv2.FONT_HERSHEY_SIMPLEX, 1, (0, 0, 255), 2)
+            cv2.putText(error_frame, "CAMERA ERROR", (50, 240), cv2.FONT_HERSHEY_SIMPLEX, 1.5, (0, 0, 255), 3)
             ret_err, buffer_err = cv2.imencode('.jpg', error_frame)
             frame_bytes_err = buffer_err.tobytes()
             yield (b'--frame\r\n'
-                    b'Content-Type: image/jpeg\r\n\r\n' + frame_bytes_err + b'\r\n')
-            cv2.waitKey(1000) # Wait a bit before sending next error frame
-        # No need for cap.release() as it failed to open
+                   b'Content-Type: image/jpeg\r\n\r\n' + frame_bytes_err + b'\r\n')
+            time.sleep(1)
 
-    while True:
-        ret, frame = cap.read()
-        if not ret:
-            print("Failed to grab frame during runtime. Stream may have ended.")
-            break # Exit loop if frame cannot be read
+    try:
+        while True:
+            ret, frame = cap.read()
+            if not ret:
+                print("Failed to grab frame during runtime.")
+                break
 
-        # Reset the current prediction for this frame
-        current_prediction = {}
+            all_faces_data_for_frame = []
+            frame_to_display = frame.copy()
 
-        if recognition_active:
-            # Check if face_detector loaded successfully before using it
-            if face_detector is None:
-                cv2.putText(frame, "Face Detector Error!", (20, 60), cv2.FONT_HERSHEY_SIMPLEX, 0.8, (0, 0, 255), 2)
-                # Skip face detection and processing if detector is not loaded
-                ret2, buffer = cv2.imencode('.jpg', frame)
-                frame_bytes = buffer.tobytes()
-                yield (b'--frame\r\n'
-                        b'Content-Type: image/jpeg\r\n\r\n' + frame_bytes + b'\r\n')
-                continue # Go to next frame
-
-            # Convert to grayscale for face detection and LBPH recognition
-            gray = cv2.cvtColor(frame, cv2.COLOR_BGR2GRAY)
-            faces = face_detector.detectMultiScale(gray, scaleFactor=1.1, minNeighbors=5, minSize=(100, 100))
-            
-            for (x, y, w, h) in faces:
-                # Get regions for recognition and age/gender detection
-                face_roi_gray = gray[y:y+h, x:x+w]
-                face_roi_color = frame[y:y+h, x:x+w]
-
-                # --- Face Recognition (only if model loaded) ---
-                name_text = "Unknown"
-                if my_model:
-                    label, confidence = my_model.predict(face_roi_gray)
-                    threshold = 100   # Lower confidence values mean a more reliable match
-                    if confidence < threshold:
-                        name_text = PersonNames[label]
-                    else:
-                        name_text = "Unknown"
-
-                # Draw rectangle and name
-                if name_text != "Unknown":
-                    cv2.rectangle(frame, (x, y), (x+w, y+h), (10, 255, 10), 2)
-                    cv2.putText(frame, name_text, (x, y-10), cv2.FONT_HERSHEY_SIMPLEX, 0.9, (10, 255, 10), 2)
+            if recognition_active:
+                if face_detector is None:
+                    cv2.putText(frame_to_display, "Face Detector Error!", (20, 60), FONT, FONT_SCALE, (0, 0, 255), FONT_THICKNESS)
                 else:
-                    cv2.rectangle(frame, (x, y), (x+w, y+h), (0, 0, 255), 2)
-                    cv2.putText(frame, name_text, (x, y-10), cv2.FONT_HERSHEY_SIMPLEX, 0.9, (0, 0, 255), 2)
+                    gray = cv2.cvtColor(frame, cv2.COLOR_BGR2GRAY)
+                    faces = face_detector.detectMultiScale(gray, scaleFactor=1.1, minNeighbors=5, minSize=(100, 100))
 
-                # --- Age & Gender Prediction (only if models loaded) ---
-                age = "N/A"
-                gender = "N/A"
-                gender_conf = 0.0
-                age_conf = 0.0
+                    for (x, y, w, h) in faces:
+                        face_roi_gray = gray[y:y+h, x:x+w]
+                        face_roi_color = frame[y:y+h, x:x+w]
 
-                if age_net and gender_net: # Only proceed if both age_net and gender_net loaded successfully
-                    blob = cv2.dnn.blobFromImage(face_roi_color, 1.0, (227,227), MODEL_MEAN_VALUES, swapRB=False)
-                    
-                    # Gender prediction
-                    gender_net.setInput(blob)
-                    gender_preds = gender_net.forward()
-                    gender = gender_list[gender_preds[0].argmax()]
-                    gender_conf = gender_preds[0][gender_preds[0].argmax()]
+                        name_text = "Unknown"
+                        confidence_display = "N/A"
+                        confidence_val = 1000
 
-                    # Age prediction
-                    age_net.setInput(blob)
-                    age_preds = age_net.forward()
-                    age = age_list[age_preds[0].argmax()]
-                    age_conf = age_preds[0][age_preds[0].argmax()]
+                        if my_model and len(PersonNames) > 0:
+                            label, conf_val = my_model.predict(face_roi_gray)
+                            threshold = 100
+                            confidence_val = conf_val
 
-                info_text = f"{gender}, {age}"
-                cv2.putText(frame, info_text, (x, y+h+30), cv2.FONT_HERSHEY_SIMPLEX, 0.8, (255, 100, 20), 2)
-                
-                # Update the global prediction with the first face's data found
-                current_prediction = {
-                    "name": name_text,
-                    "age": age,
-                    "gender": gender,
-                    # Convert float32 to standard Python float for JSON serialization
-                    "confidence": float(round(confidence, 2)) if my_model else "N/A",
-                    "gender_confidence": float(round(gender_conf, 2)),
-                    "age_confidence": float(round(age_conf, 2))
-                }
-                break   # Only process the first detected face for prediction
+                            if conf_val < threshold:
+                                name_text = PersonNames[label]
+                                percentage_confidence = max(0, min(100, 100 - (conf_val * 0.5)))
+                                confidence_display = f"{percentage_confidence:.2f}%"
+                            else:
+                                name_text = "Unknown"
+                                confidence_display = "N/A"
+                        elif my_model:
+                            name_text = "Unknown (No trained people)"
+                            confidence_display = "N/A"
 
-        else: # If recognition is not active
-            cv2.putText(frame, "Recognition Stopped", (20, 30), cv2.FONT_HERSHEY_SIMPLEX, 0.8, (0, 255, 255), 2)
+                        box_color = COLOR_RECOGNIZED if name_text != "Unknown" and "trained people" not in name_text else COLOR_UNKNOWN
+                        cv2.rectangle(frame_to_display, (x, y), (x+w, y+h), box_color, 2)
 
-        # Encode frame as JPEG
-        ret2, buffer = cv2.imencode('.jpg', frame)
-        frame_bytes = buffer.tobytes()
-        
-        yield (b'--frame\r\n'
-                b'Content-Type: image/jpeg\r\n\r\n' + frame_bytes + b'\r\n')
-    
-    cap.release()
+                        age = "N/A"
+                        gender = "N/A"
 
-# --- Flask Routes ---
+                        if age_net and gender_net:
+                            blob = cv2.dnn.blobFromImage(face_roi_color, 1.0, (227,227), MODEL_MEAN_VALUES, swapRB=False)
+                            gender_net.setInput(blob)
+                            gender_preds = gender_net.forward()
+                            gender = gender_list[gender_preds[0].argmax()]
+
+                            age_net.setInput(blob)
+                            age_preds = age_net.forward()
+                            age = age_list[age_preds[0].argmax()]
+                        else:
+                            cv2.putText(frame_to_display, "Age/Gender Models Not Loaded!", (x, y - 50), FONT, 0.6, (0, 0, 255), 1)
+
+                        current_y_offset = y + h + 10
+                        info_lines = [
+                            f"Name: {name_text}",
+                            f"Confidence: {confidence_display}",
+                            f"Gender: {gender}",
+                            f"Age: {age}"
+                        ]
+                        for line in info_lines:
+                            (text_width, text_height), baseline = cv2.getTextSize(line, FONT, FONT_SCALE, FONT_THICKNESS)
+                            cv2.rectangle(frame_to_display, (x, current_y_offset), (x + text_width + 2 * PADDING, current_y_offset + text_height + 2 * PADDING), COLOR_TEXT_BG, cv2.FILLED)
+                            cv2.putText(frame_to_display, line, (x + PADDING, current_y_offset + text_height + PADDING), FONT, FONT_SCALE, COLOR_TEXT, FONT_THICKNESS)
+                            current_y_offset += (text_height + 2 * PADDING) + PADDING
+
+                        all_faces_data_for_frame.append({
+                            "name": name_text,
+                            "age": age,
+                            "gender": gender,
+                            "confidence": confidence_display,
+                            "confidence_val": confidence_val # Raw confidence for better sorting/logic if needed
+                        })
+            else:
+                overlay = frame.copy()
+                cv2.rectangle(overlay, (0,0), (frame.shape[1], frame.shape[0]), (0, 0, 0), -1)
+                alpha = 0.4
+                frame_to_display = cv2.addWeighted(overlay, alpha, frame, 1 - alpha, 0)
+                text_stopped = "Recognition Stopped"
+                (text_width, text_height), baseline = cv2.getTextSize(text_stopped, FONT, FONT_SCALE * 1.5, FONT_THICKNESS * 2)
+                text_x = int((frame.shape[1] - text_width) / 2)
+                text_y = int((frame.shape[0] + text_height) / 2)
+                cv2.putText(frame_to_display, text_stopped, (text_x, text_y), FONT, FONT_SCALE * 1.5, (0, 255, 255), FONT_THICKNESS * 2)
+                all_faces_data_for_frame = [] # Clear predictions when stopped
+
+            # Push the predictions to the queue
+            prediction_queue.put({"faces": all_faces_data_for_frame})
+
+            ret2, buffer = cv2.imencode('.jpg', frame_to_display)
+            frame_bytes = buffer.tobytes()
+
+            yield (b'--frame\r\n'
+                   b'Content-Type: image/jpeg\r\n\r\n' + frame_bytes + b'\r\n')
+    finally:
+        cap.release()
+
 @app.route('/')
 def index():
     return render_template('index.html')
@@ -202,16 +261,31 @@ def video_feed():
 def toggle_recognition():
     global recognition_active
     data = request.get_json()
-    recognition_active = data.get("active", False)
+    new_status = data.get("active", False)
+
+    if new_status and not recognition_active:
+        print("Starting recognition...")
+        load_all_models() # Reload models to ensure they're ready and up-to-date
+    
+    recognition_active = new_status
     status_msg = "Recognition started" if recognition_active else "Recognition stopped"
     print(status_msg)
+
+    # Immediately push a status update
+    prediction_queue.put({"faces": [], "status": status_msg})
+
     return jsonify({"status": "success", "recognition_active": recognition_active, "message": status_msg})
 
-@app.route('/get_predictions')
-def get_predictions():
-    return jsonify(current_prediction)
+@app.route('/stream_predictions')
+def stream_predictions():
+    def event_stream():
+        while True:
+            # Wait for a new prediction from the queue
+            predictions = prediction_queue.get()
+            yield f"data: {json.dumps(predictions)}\n\n"
+            prediction_queue.task_done()
+    return Response(event_stream(), mimetype="text/event-stream")
 
 if __name__ == '__main__':
-    # Ensure Flask is run in a way that allows camera access
-    # Use 0.0.0.0 to make it accessible from other devices on the network
-    app.run(host='0.0.0.0', port=5000, debug=True, threaded=True) # threaded=True helps with camera stream stability
+    load_all_models()
+    app.run(host='0.0.0.0', port=5000, debug=True, threaded=True)
